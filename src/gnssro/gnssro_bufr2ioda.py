@@ -206,8 +206,9 @@ def get_obs_data(bufr, profile_meta_data, add_qc, addLSW, record_number=None, on
     impact = codes_get_array(bufr, 'impactParameter')[offset::drepfac[0]]
     bang = codes_get_array(bufr, 'bendingAngle')[offset*2::drepfac[0]*2]
     bang_err = codes_get_array(bufr, 'bendingAngle')[offset*2+1::drepfac[0]*2]
-    if only_bang:
-        bang_err[:] = 0.003
+    #Hui 
+    #Hui if only_bang:
+    #Hui     bang_err[:] = 0.003
     bang_conf = codes_get_array(bufr, 'percentConfidence')[1:krepfac[0]+1]
     # len (bang) Out[19]: 1482  (krepfac * 6) -or- (krepfac * drepfac * 2 )`
 
@@ -245,10 +246,10 @@ def get_obs_data(bufr, profile_meta_data, add_qc, addLSW, record_number=None, on
         refrac = codes_get_array(bufr, 'atmosphericRefractivity')[0::2]
         refrac_err = codes_get_array(bufr, 'atmosphericRefractivity')[1::2]
 
-    try:
-        height = codes_get_array(bufr, 'geopotentialHeight', ktype=float)
-    except Exception as e:
-        height = codes_get_array(bufr, 'height', ktype=float)
+    #Hui try:
+    #Hui     height = codes_get_array(bufr, 'geopotentialHeight', ktype=float)
+    #Hui except Exception as e:
+    height = codes_get_array(bufr, 'height', ktype=float)
 
     # value, ob_error, qc
     obs_data[('atmosphericRefractivity', "ObsValue")] = assign_values(refrac)
