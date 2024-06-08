@@ -57,7 +57,7 @@ def get_confidence_qc_mask(qfarr,aerosol_type,conf_lvl='MedHigh'):
     else:
         print(f'ERROR: No configuration for confidence level {conf_lvl}') 
         
-    #diagnostic test printout -- currently only useful for positive values 
+    #diagnostic test printout
     #binary output needs converted to twos complement to directly check negative values
     # for i,val in enumerate(conf_mask):
     #     qfarr_i = int(qfarr[i])
