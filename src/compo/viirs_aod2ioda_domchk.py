@@ -12,11 +12,14 @@ from datetime import datetime
 import netCDF4 as nc
 import numpy as np
 import os
-
 import glob
+
 import pyiodaconv.ioda_conv_engines as iconv
 from collections import defaultdict, OrderedDict
 from pyiodaconv.orddicts import DefaultOrderedDict
+
+import os, sys
+import math as m
 
 def get_confidence_qc_mask(qfarr,aerosol_type,conf_lvl='MedHigh'):
     #Currently modified to combine qf and adp masks into one 
@@ -30,7 +33,7 @@ def get_confidence_qc_mask(qfarr,aerosol_type,conf_lvl='MedHigh'):
     #want to return an array with False for rejected obs (values 3 and 1 base10)
     #and True for accepted obs (values 0 and 2 in base10).
     
-    if conf_lvl == 'med' or conf_lvl == 'medhigh':
+    if conf_lvl == 'med':
       conf_lvl = 'MedHigh'
     if conf_lvl == 'low':
       conf_lvl = 'Low'
@@ -56,8 +59,8 @@ def get_confidence_qc_mask(qfarr,aerosol_type,conf_lvl='MedHigh'):
         conf_mask = conf == 1
     else:
         print(f'ERROR: No configuration for confidence level {conf_lvl}') 
-        
-    #diagnostic test printout
+    
+    #diagnostic test printout -- currently only useful for positive values 
     #binary output needs converted to twos complement to directly check negative values
     # for i,val in enumerate(conf_mask):
     #     qfarr_i = int(qfarr[i])
@@ -98,15 +101,19 @@ long_missing_value = nc.default_fillvals['i8']
 
 
 class AOD(object):
-    def __init__(self, filenames, method, mask, thin, adp_mask, adp_qc_lvl):
+    def __init__(self, filenames, method, mask, thin, adp_mask, adp_qc_lvl,aod_qc_lvl):
         self.filenames = filenames
         self.mask = mask
         self.method = method
         self.thin = thin
         self.adp_mask = adp_mask
+
         self.adp_qc_lvl = adp_qc_lvl
         if self.adp_qc_lvl is None:
           self.adp_qc_lvl = 'MedHigh' #default to including Medium and High Confidence obs based on ADP data
+
+        self.aod_qc_lvl = aod_qc_lvl
+
         self.varDict = defaultdict(lambda: defaultdict(dict))
         self.outdata = defaultdict(lambda: DefaultOrderedDict(OrderedDict))
         self.varAttrs = DefaultOrderedDict(lambda: DefaultOrderedDict(dict))
@@ -162,10 +169,12 @@ class AOD(object):
         for f in self.filenames:
             try:
                 ncd = nc.Dataset(f, 'r')
+                print('nc_file',f)
             except FileNotFoundError:
                 print(f'AOD data file {f} not found, continuing to next file in list or ending if at end of list.')
                 continue
             gatts = {attr: getattr(ncd, attr) for attr in ncd.ncattrs()}
+
             base_datetime = datetime.strptime(gatts["time_coverage_end"], '%Y-%m-%dT%H:%M:%SZ')
             self.satellite = gatts["satellite_name"]
             self.sensor = gatts["instrument_name"]
@@ -173,7 +182,7 @@ class AOD(object):
             AttrData["sensor"] = self.sensor
 
             if AttrData['sensor'] == 'VIIRS':
-                AttrData['sensor'] = "v.viirs-m_npp"
+                AttrData['sensor'] = "v.viirs-m_npp" #should this work for n20 and n21 as well?
             if AttrData['platform'] == 'NPP':
                 AttrData['platform'] = "suomi_npp"
 
@@ -190,7 +199,6 @@ class AOD(object):
 
             qcall = ncd.variables['QCAll'][:].ravel().astype('int32')
             obs_time = np.full(np.shape(qcall), base_datetime, dtype=object)
-
             ncd.close()
 
             #apply ADP mask if indicated by user
@@ -280,7 +288,57 @@ class AOD(object):
                 qcpath_dust = np.ma.masked_where(np.logical_or(adpmaskdust,conf_mask_dust),qcpath)
                 qcall_dust = np.ma.masked_where(np.logical_or(adpmaskdust,conf_mask_dust),qcall)
                 obs_time_dust = np.ma.masked_where(np.logical_or(adpmaskdust,conf_mask_dust),obs_time)
-                           
+          
+            # Apply AOD QC mask
+            if self.aod_qc_lvl:
+                if self.aod_qc_lvl == 'MedHigh':
+                   qc_mask = qcall == 2  # mask qcall=2: True, for missing value: False
+                elif self.aod_qc_lvl == 'High':
+                   qc_mask = np.logical_or(qcall == 1, qcall == 2)
+                elif self.aod_qc_lvl == 'Med':
+                   qc_mask = np.logical_or(qcall == 0, qcall == 2)
+                elif self.aod_qc_lvl == 'Low':
+                   qc_mask = np.logical_or(qcall == 0, qcall == 1)
+                else:
+                   print('Invalid QC flag, please specify AOD QC: High or Medium or Low or MedHigh, default(no specification) is None')
+                   exit()
+
+                print ('Checking if Obs falls inside the domain... it takes a few minutes.')
+                chk = np.zeros(len(qcall), dtype=bool)
+                for idx in range(len(lats)):
+                       TorF = rrfs_domain_check(lats[idx], lons[idx])
+                       chk[idx] = TorF     #"True => outside" 
+
+                print('obs outside domain:')
+                print(f'{chk.sum()} of {chk.size}')
+
+                qc_mask = np.logical_or(qc_mask, chk)
+
+                lons = np.ma.masked_where(qc_mask,lons)
+                lats = np.ma.masked_where(qc_mask,lats)
+                obs_time = np.ma.masked_where(qc_mask,obs_time)
+                vals = np.ma.masked_where(qc_mask,vals)
+                errs = np.ma.masked_where(qc_mask,errs)
+                qcpath = np.ma.masked_where(qc_mask,qcpath)
+                qcall = np.ma.masked_where(qc_mask,qcall)
+                
+                if self.adp_mask:
+                   lons_smoke = np.ma.masked_where(qc_mask,lons_smoke)
+                   lats_smoke = np.ma.masked_where(qc_mask,lats_smoke) 
+                   obs_time_smoke = np.ma.masked_where(qc_mask,obs_time_smoke)
+                   vals_smoke = np.ma.masked_where(qc_mask,vals_smoke)
+                   errs_smoke = np.ma.masked_where(qc_mask,errs_smoke)
+                   qcpath_smoke = np.ma.masked_where(qc_mask,qcpath_smoke)
+                   qcall_smoke = np.ma.masked_where(qc_mask,qcall_smoke)
+                   
+                   lons_dust = np.ma.masked_where(qc_mask,lons_dust) 
+                   lats_dust = np.ma.masked_where(qc_mask,lats_dust) 
+                   obs_time_dust = np.ma.masked_where(qc_mask,obs_time_dust)
+                   vals_dust = np.ma.masked_where(qc_mask,vals_dust)
+                   errs_dust = np.ma.masked_where(qc_mask,errs_dust)
+                   qcpath_dust = np.ma.masked_where(qc_mask,qcpath_dust)
+                   qcall_dust = np.ma.masked_where(qc_mask,qcall_dust)
+
             #Remove masked elements if 'maskout' is indictated
             if self.mask == 'maskout':
                 mask = np.logical_not(vals.mask)
@@ -291,7 +349,7 @@ class AOD(object):
                 qcpath = qcpath[mask]        
                 qcall = qcall[mask]     
                 obs_time = obs_time[mask] 
-                
+
                 if self.adp_mask:
                     
                     mask_smoke = np.logical_not(vals_smoke.mask)
@@ -341,7 +399,7 @@ class AOD(object):
                 qcpath = qcpath[mask_thin]
                 qcall = qcall[mask_thin]
                 obs_time = obs_time[mask_thin]
-            
+
                 if self.adp_mask:
                     
                     #switch smoke and dust to just use mask_thin if moved above maskout block
@@ -365,6 +423,7 @@ class AOD(object):
             
             # defined surface type and uncertainty
             if self.method == "nesdis":
+                print('apply error_nesdis')
                 errs = 0.111431 + 0.128699*vals    # over land (dark)
                 errs[qcpath % 2 == 1] = 0.00784394 + 0.219923*vals[qcpath % 2 == 1]  # over ocean
                 errs[qcpath % 4 == 2] = 0.0550472 + 0.299558*vals[qcpath % 4 == 2]   # over bright land
@@ -383,6 +442,7 @@ class AOD(object):
             self.outdata[('latitude', metaDataName)] = np.append(self.outdata[('latitude', metaDataName)], np.array(lats, dtype=np.float32))
             self.outdata[('longitude', metaDataName)] = np.append(self.outdata[('longitude', metaDataName)], np.array(lons, dtype=np.float32))
             self.outdata[('dateTime', metaDataName)] = np.append(self.outdata[('dateTime', metaDataName)], np.array(obs_time, dtype=object))
+            #print('obs_num',len(self.outdata[('latitude', metaDataName)]))
 
             for iodavar in obsvars:
 
@@ -430,6 +490,140 @@ class AOD(object):
             DimDict_dust['Channel'] = np.array(channels)
 
 
+# Check to determine if a point falls inside CONUS-13km NA [HChoi 6/23/2023]
+# Code from lam_domaincheck_esg_c subroutine in LAMDomainCheck.interface.F90
+# ****
+# ** Need to modify to work with RRFS_CONUS_3km grid rather than 13km grid
+# ****
+
+#RRFS_CONUS_3km attributes:
+#                :history = "gnomonic_ed" ;
+#                :source = "FV3GFS" ;
+#                :grid = "akappa" ;
+#                :plat = 38.5 ;
+#                :plon = -97.5 ;
+#                :pazi = 0. ;
+#                :delx = 0.0133832493826963 ;
+#                :dely = 0.0134514799980787 ;
+#                :lx = -1830 ;
+#                :ly = -1102 ;
+#                :a = 0.115642194928891 ;
+#                :k = -0.347294127343107 ;
+#                :avg_cell_size = 2979.71711090602 ;
+#                :RES_equiv = 3359 ;
+#                supergrid_npx: 3652 (with halo)
+#                supergrid_npy: 2196 (with halo)
+#                write grid npx: 1799
+#                write grid npy: 1059
+#                compute grid npx: 1820 (no halo)
+#                compute grid npy: 1092 (no halo)
+def rrfs_domain_check(lat,lon):
+  alpha = 0.115642194928891     # alpha parameter for ESG grid definition
+  kappa = -0.347294127343107    # kappa paramater for ESG grid definition
+  plat = 38.5                   # center point latitude of ESG grid (degrees)
+  plon = -97.5                  # center point longitude of ESG grid (degrees)
+  pazi = 0.0                    # azimuth angle for ESG grid definition
+  npx = 3640                     # number of grid points in x direction (supergrid minus halo)
+  npy = 2184                     # number of grid points in y direction (supergrid minus halo)
+#  dx = 0.01349                 # grid spacing in degrees (3 km grid spacing)
+#  dy = 0.01349                 # grid spacing in degrees (3 km grid spacing)
+  delx = 0.000116790883172      # grid spacing of supergrid in map units (radians)
+  dely = 0.000117386307617      # grid spacing of supergrid in map units (radians)
+  failure = False               # failure code
+
+  plat = plat * (m.pi / 180.0)  # convert to radians
+  plon = plon * (m.pi / 180.0)  # convert to radians
+  delx = delx * 2               # multiply by 2 to get actual grid resolution
+  dely = dely * 2               # multiply by 2 to get actual grid resolution
+  lat = lat * (m.pi / 180.0)    # convert to radians
+  lon = lon * (m.pi / 180.0)    # convert to radians
+#  print (delx)
+#  sys.exit('STOP!!')
+# gtoxm_ak_rr subroutine from Jim Purser's pesg.f90 code
+
+  clat = m.cos(plat)
+  slat = m.sin(plat)
+  clon = m.cos(plon)
+  slon = m.sin(plon)
+  cazi = m.cos(pazi)
+  sazi = m.sin(pazi)
+
+  azirot = [[cazi,  sazi, 0],
+            [-sazi, cazi, 0],
+            [0,     0,    1]]
+  prot = [[-slon,      clon,       0],
+          [-slat*clon, -slat*slon, clat],
+          [clat*clon,  clat*slon,  slat]]
+
+  azirot = np.array(azirot)
+  prot = np.array(prot)
+  prot = np.matmul(prot,azirot)
+
+  sla = m.sin(lat) #numpy throwing a warning about converting a masked element to nan for these lines with some granules; may need to mask the nans, but not sure yet
+  cla = m.cos(lat)
+  slo = m.sin(lon)
+  clo = m.cos(lon)
+
+  xe = [[cla*clo],
+        [cla*slo],
+        [sla]]
+
+  xe = np.array(xe)
+  xc = np.matmul(prot,xe)       # Do NOT use the transpose of prot here
+
+  xc = np.array(xc)
+  zp = float(xc[2]) + 1.0
+  xs = xc[0:2]/zp
+
+  xs = np.array(xs)
+
+  s = kappa * (float(xs[0])*float(xs[0]) + float(xs[1])*float(xs[1]))
+  sc = 1.0 - s
+  if (abs(s) >= 1.0):
+    failure = True
+  xt = (2.0 * xs) / sc
+
+  xm = xt       # Define xm, will set correct values below
+
+  if (alpha > 0):
+    ra = m.sqrt(alpha)
+    razt = ra * xt[0]
+    xm[0] = m.atan(razt) / ra
+  elif (alpha < 0):
+    ra = m.sqrt(-alpha)
+    razt = ra * xt[0]
+    if (abs(razt) >= 1.0):
+      failure = True
+    xm[0] = m.atanh(razt) / ra
+  else:
+    xm[0] = xt[0]
+
+  if (alpha > 0):
+    ra = m.sqrt(alpha)
+    razt = ra * xt[1]
+    xm[1] = m.atan(razt) / ra
+  elif (alpha < 0):
+    ra = m.sqrt(-alpha)
+    razt = ra * xt[1]
+    if (abs(razt) >= 1.0):
+      failure = True
+    xm[1] = m.atanh(razt) / ra
+  else:
+    xm[1] = xt[1]
+
+  xm[0] = xm[0]/delx
+  xm[1] = xm[1]/dely
+ #print((xm))
+
+# use xm to determine if point is good or bad
+  if ((abs(xm[0])) < (npx/2)) and ((abs(xm[1])) < (npy/2)) and (failure == False):
+  # Point is inside the ESG grid
+    check = False
+  else:
+  # Point is outside the ESG grid
+    check = True
+
+  return(check)
 def main():
 
     # get command line arguments
@@ -455,6 +649,10 @@ def main():
         help="calculation error method: nesdis/default, default=none",
         type=str, required=True)
     parser.add_argument(
+        '-q','--aod_qc_lvl',
+        help="set minimum AOD QC confidence level, use 'Low','Med', 'High' or 'MedHigh': default=None",
+        type=str, default=None)
+    parser.add_argument(
         '-k', '--mask',
         help="maskout missing values: maskout/default, default=none",
         type=str, required=True)
@@ -470,15 +668,14 @@ def main():
 	default=False)
     parser.add_argument(
 	'--adp_qc_lvl',
-	help="set ADP QC confidence level for smoke and dust obs, use 'low','med', 'medhigh',or 'high': default='medhigh'",
+	help="set minimum ADP QC confidence level for smoke and dust obs, use 'low','med', or 'high': default='med'",
 	type=str, required=False)
 
     args = parser.parse_args()
-
     # setup the IODA writer
 
     # Read in the AOD data and perform requested processing
-    aod = AOD(args.input, args.method, args.mask, args.thin, args.adp_mask, args.adp_qc_lvl)
+    aod = AOD(args.input, args.method, args.mask, args.thin, args.adp_mask, args.adp_qc_lvl, args.aod_qc_lvl)
 
     # Write everything out. Use try-except because if all obs are filtered out of 
     # one of the datasets due to either masking or thinning or a combination, an IndexError will be thrown
